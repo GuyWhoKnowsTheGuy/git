@@ -18,28 +18,50 @@ DESCRIPTION
 The Hermes Ark Git fork ships `git-remote-tau`, a remote-helper that makes
 `tau://` repositories available to this Git client.
 
-A `tau://` repository is Tau-native.  The helper publishes repository manifests
-whose refs point to `tau:<hash>` object identities.  Git object names are kept as
-compatibility metadata so the forked client can continue to materialize working
-trees through Git's existing fast-import and fast-export machinery.
+A `tau://` repository is Tau-native.  HTTP(S) and SSH remotes continue to use
+Git's normal object database and Git object identifiers.  The `tau://` transport
+uses Tau object identities instead: refs point to `tau:<hash>` values, commit
+objects point to Tau tree and parent objects, and tree objects point to Tau child
+objects.
 
-The initial payload codec is `git-raw-v1`: the stored payload for each object is
-the normal serialized Git object byte stream:
+Git object IDs are bridge-local implementation details used only while the helper
+imports from or exports to Git's fast-import/fast-export protocol.  They are not
+written to Tau manifests or Tau objects.
 
-	<object-type> <size>\0<body>
+TAU OBJECT CODEC
+----------------
 
-The Tau identity of that payload is a content address.  In local-only mode the
-payload is stored under `GIT_TAU_STORE`.  When TauStorage client mode is enabled,
-the helper uploads/downloads payloads and manifests through the networked
-TauStorage/Autonomi-compatible client API.
+The object codec is `tau-native-v1`.  Each Tau object is canonical JSON hashed by
+SHA-256 over the canonical byte representation.  The resulting hash is the Tau
+object identity and storage key.
+
+Blob object::
+	Stores file content as base64.  Blobs have no child references.
+
+Tree object::
+	Stores entries containing mode, name, child kind, and child object reference.
+	The child reference is always `tau:<hash>`.
+
+Commit object::
+	Stores `tree`, `parents`, non-identity commit headers, and message.  The tree
+	and parent references are always `tau:<hash>`.
+
+Tag object::
+	Stores the tagged object as `tau:<hash>`, the tagged object kind, tag headers,
+	and message.
+
+This means a reader can walk repository history directly in TauStorage by reading
+manifest refs, loading Tau commit objects, following Tau parent/tree references,
+and then following Tau tree entries.  No Git SHA-1 lookup table is required or
+present in Tau storage.
 
 STORAGE MODES
 -------------
 
-Local prototype store
-~~~~~~~~~~~~~~~~~~~~~
+Local Tau store
+~~~~~~~~~~~~~~~
 
-By default, the prototype store lives at:
+By default, the local Tau store lives at:
 
 	$HOME/.git-tau/store
 
@@ -50,26 +72,28 @@ For tests or isolated repositories, set `GIT_TAU_STORE`:
 The store contains:
 
 `objects/`::
-	Content-addressed object payloads.
+	Tau-native content-addressed objects.  The path is derived from the Tau object
+	hash.
 
 `repos/<name>/cache.git`::
-	A local bare Git cache used to bridge Git fast-import/export while the payload
-	codec is `git-raw-v1`.
+	A local bare Git bridge cache.  This cache exists so regular Git commands can
+	interoperate with the Tau-native object graph; it is not the canonical remote
+	state.
 
 `repos/<name>/latest.json`::
-	The latest Tau-native manifest.  Refs in this manifest point to Tau object IDs,
-	not Git object IDs.
+	The latest Tau-native repository manifest.  Refs in this manifest point to Tau
+	object IDs.
 
 TauStorage client API mode
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Set `GIT_TAU_DEVNET_MANIFEST` to enable networked TauStorage client mode.  The
-helper then calls an Autonomi-compatible client command for every object payload
-and manifest:
+helper then calls an Autonomi-compatible client command for every Tau-native
+object and manifest:
 
 [listing]
 ----
-ant file upload <payload> \
+ant file upload <tau-object-json> \
 	--public \
 	--devnet-manifest <manifest> \
 	--allow-loopback \
@@ -94,19 +118,17 @@ Environment variables:
 	EVM network argument for the client. Defaults to `local`.
 
 `GIT_TAU_STORE`::
-	Local helper state, manifest pointer files, and bridge cache. Even in
-	TauStorage client mode this remains the local working cache, not the canonical
-	object store.
+	Local helper state, manifest pointer files, Tau object cache, and Git bridge
+	cache.
 
-In TauStorage client mode, each object entry records the returned network
-address:
+In TauStorage client mode, each manifest object entry records the returned
+network address:
 
 [listing]
 ----
 "<tau-hash>": {
-  "kind": "blob",
-  "payload_codec": "git-raw-v1",
-  "git": { "hash_algorithm": "sha1", "oid": "<git-object-id>" },
+  "kind": "commit",
+  "size": 428,
   "taustorage": { "address": "tau://..." }
 }
 ----
@@ -123,40 +145,59 @@ A published manifest contains fields like:
 [listing]
 ----
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "repository": "demo",
   "identity_mode": "tau-native",
-  "payload_codec": "git-raw-v1",
+  "object_codec": "tau-native-v1",
   "refs": {
-    "refs/heads/main": "tau:<hash>"
+    "refs/heads/main": "tau:<commit-tau-hash>"
   },
   "objects": {
-    "<tau-hash>": {
+    "<commit-tau-hash>": {
       "kind": "commit",
-      "payload_codec": "git-raw-v1",
-      "git": {
-        "hash_algorithm": "sha1",
-        "oid": "<git-object-id>"
-      },
+      "size": 428,
       "taustorage": {
         "address": "tau://<network-address>"
       }
     }
   },
-  "git_to_tau": {
-    "git:sha1:<git-object-id>": "<tau-hash>"
-  }
+  "signing": { "algorithm": null, "signature": null }
 }
 ----
 
-LIMITATIONS
------------
+A commit object contains Tau references only:
 
-This is an MVP transport for the forked Git client.  Tau-native manifests,
-network client upload/download plumbing, and `tau://` Git UX are in place.  The
-current payload codec still uses `git-raw-v1` and a local bare Git bridge cache;
-a future version can switch the payload codec to Tau-native commit/tree/blob
-objects.
+[listing]
+----
+{
+  "schema_version": 1,
+  "codec": "tau-native-v1",
+  "kind": "commit",
+  "tree": "tau:<tree-tau-hash>",
+  "parents": ["tau:<parent-commit-tau-hash>"],
+  "headers_b64": ["..."],
+  "message_b64": "..."
+}
+----
+
+A tree object contains Tau references only:
+
+[listing]
+----
+{
+  "schema_version": 1,
+  "codec": "tau-native-v1",
+  "kind": "tree",
+  "entries": [
+    {
+      "mode": "100644",
+      "name_b64": "UkVBRE1FLm1k",
+      "kind": "blob",
+      "object": "tau:<blob-tau-hash>"
+    }
+  ]
+}
+----
 
 SEE ALSO
 --------
