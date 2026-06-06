@@ -115,6 +115,7 @@ manpages = {
   'git-refs.adoc' : 1,
   'git-remote-ext.adoc' : 1,
   'git-remote-fd.adoc' : 1,
+  'git-remote-tau.adoc' : 1,
   'git-remote.adoc' : 1,
   'git-repack.adoc' : 1,
   'git-replace.adoc' : 1,

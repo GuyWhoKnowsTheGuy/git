@@ -1,0 +1,101 @@
+git-remote-tau(1)
+=================
+
+NAME
+----
+git-remote-tau - Tau-native transport helper for tau:// repositories
+
+SYNOPSIS
+--------
+[verse]
+'git clone' tau://<repository>
+'git fetch' <tau-remote>
+'git push' <tau-remote> <refspec>
+
+DESCRIPTION
+-----------
+
+The Hermes Ark Git fork ships `git-remote-tau`, a remote-helper that makes
+`tau://` repositories available to this Git client.
+
+A `tau://` repository is Tau-native.  The helper publishes repository manifests
+whose refs point to `tau:<hash>` object identities.  Git object names are kept as
+compatibility metadata so the forked client can continue to materialize working
+trees through Git's existing fast-import and fast-export machinery.
+
+The initial payload codec is `git-raw-v1`: the stored payload for each object is
+the normal serialized Git object byte stream:
+
+	<object-type> <size>\0<body>
+
+The Tau identity of that payload is the SHA-256 content address used by the
+prototype local Tau store.  A later implementation can replace this local store
+with the real TauStorage API without changing the user-facing `tau://` transport
+contract.
+
+STORAGE
+-------
+
+By default, the prototype store lives at:
+
+	$HOME/.git-tau/store
+
+For tests or isolated repositories, set `GIT_TAU_STORE`:
+
+	GIT_TAU_STORE=/tmp/tau-store git clone tau://demo
+
+The store contains:
+
+`objects/`::
+	Content-addressed object payloads.
+
+`repos/<name>/cache.git`::
+	A local bare Git cache used to bridge Git fast-import/export while the payload
+	codec is `git-raw-v1`.
+
+`repos/<name>/latest.json`::
+	The latest Tau-native manifest.  Refs in this manifest point to Tau object IDs,
+	not Git object IDs.
+
+MANIFEST SHAPE
+--------------
+
+A published manifest contains fields like:
+
+[listing]
+----
+{
+  "schema_version": 1,
+  "repository": "demo",
+  "identity_mode": "tau-native",
+  "payload_codec": "git-raw-v1",
+  "refs": {
+    "refs/heads/main": "tau:<hash>"
+  },
+  "objects": {
+    "<tau-hash>": {
+      "kind": "commit",
+      "payload_codec": "git-raw-v1",
+      "git": {
+        "hash_algorithm": "sha1",
+        "oid": "<git-object-id>"
+      }
+    }
+  },
+  "git_to_tau": {
+    "git:sha1:<git-object-id>": "<tau-hash>"
+  }
+}
+----
+
+LIMITATIONS
+-----------
+
+This is the first fork-level Tau transport MVP.  It intentionally uses a local
+content-addressed store plus a bare Git cache.  The Tau-native manifest format,
+helper protocol plumbing, and `tau://` UX are in place; replacing the local store
+with real TauStorage network reads/writes is future work.
+
+SEE ALSO
+--------
+linkgit:gitremote-helpers[7], linkgit:git-fast-import[1], linkgit:git-fast-export[1]
