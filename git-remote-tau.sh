@@ -2,8 +2,10 @@
 # Tau-native remote helper shipped by the Hermes Ark Git fork.
 #
 # tau:// repositories are Tau-native: published refs point at tau:<hash> values
-# in the manifest.  The helper currently stores git-raw-v1 payloads so the forked
-# Git client can import/export through Git's fast-import protocol.
+# in the manifest.  The helper stores git-raw-v1 payloads so the forked Git
+# client can import/export through Git's fast-import protocol.  When
+# GIT_TAU_DEVNET_MANIFEST is set, payloads and manifests are uploaded/downloaded
+# through the TauStorage/Autonomi-compatible client API.
 
 alias=$1
 url=$2
@@ -24,6 +26,10 @@ repo_dir=$store/repos/$repo
 objects_dir=$store/objects
 cache_git=$repo_dir/cache.git
 latest=$repo_dir/latest.json
+latest_addr=$repo_dir/latest.addr
+tau_client=${GIT_TAU_CLIENT:-ant}
+tau_manifest=${GIT_TAU_DEVNET_MANIFEST:-}
+tau_network=${GIT_TAU_EVM_NETWORK:-local}
 
 mkdir -p "$repo_dir" "$objects_dir"
 if ! test -d "$cache_git"
@@ -43,6 +49,10 @@ test -e "$taumarks" || >"$taumarks"
 force=
 object_format=
 
+use_taustorage () {
+	test -n "$tau_manifest"
+}
+
 json_escape () {
 	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
@@ -50,6 +60,27 @@ json_escape () {
 object_path () {
 	hash=$1
 	printf '%s/%s/%s' "$objects_dir" "$(printf '%s' "$hash" | cut -c1-2)" "$(printf '%s' "$hash" | cut -c3-)"
+}
+
+tau_upload () {
+	file=$1
+	"$tau_client" file upload "$file" \
+		--public \
+		--devnet-manifest "$tau_manifest" \
+		--allow-loopback \
+		--evm-network "$tau_network" |
+	tr ' 	' '\n\n' |
+	sed -n 's/^\(tau:\/\/.*\)$/\1/p; s/^\(tau:.*\)$/\1/p' |
+	tail -n 1
+}
+
+tau_download () {
+	address=$1
+	out=$2
+	"$tau_client" file download "$address" -o "$out" \
+		--devnet-manifest "$tau_manifest" \
+		--allow-loopback \
+		--evm-network "$tau_network"
 }
 
 store_git_object () {
@@ -70,7 +101,68 @@ store_git_object () {
 	else
 		rm -f "$tmp"
 	fi
-	printf '%s %s %s %s\n' "$hash" "$oid" "$type" "$size"
+	address=-
+	if use_taustorage
+	then
+		address=$(tau_upload "$path") || return 1
+		test -n "$address" || return 1
+	fi
+	printf '%s %s %s %s %s\n' "$hash" "$oid" "$type" "$size" "$address"
+}
+
+materialize_cache_from_manifest () {
+	use_taustorage || return 0
+	test -f "$latest" || return 0
+	git --git-dir="$cache_git" show-ref --quiet && return 0
+	GIT_TAU_HELPER_CLIENT="$tau_client" \
+	GIT_TAU_HELPER_MANIFEST="$tau_manifest" \
+	GIT_TAU_HELPER_NETWORK="$tau_network" \
+	GIT_TAU_HELPER_CACHE="$cache_git" \
+	GIT_TAU_HELPER_LATEST="$latest" \
+	python3 - <<'PY'
+import hashlib
+import json
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+
+client = os.environ["GIT_TAU_HELPER_CLIENT"]
+manifest_path = os.environ["GIT_TAU_HELPER_MANIFEST"]
+network = os.environ["GIT_TAU_HELPER_NETWORK"]
+cache = os.environ["GIT_TAU_HELPER_CACHE"]
+latest = Path(os.environ["GIT_TAU_HELPER_LATEST"])
+manifest = json.loads(latest.read_text())
+objects = manifest.get("objects", {})
+with tempfile.TemporaryDirectory() as td:
+	tmpdir = Path(td)
+	for tau_hash, entry in objects.items():
+		addr = entry.get("taustorage", {}).get("address")
+		if not addr:
+			continue
+		raw_path = tmpdir / tau_hash
+		subprocess.run([
+			client, "file", "download", addr, "-o", str(raw_path),
+			"--devnet-manifest", manifest_path,
+			"--allow-loopback",
+			"--evm-network", network,
+		], check=True, stdout=subprocess.DEVNULL)
+		data = raw_path.read_bytes()
+		if hashlib.sha256(data).hexdigest() != tau_hash:
+			raise SystemExit(f"TauStorage payload hash mismatch for {tau_hash}")
+		header, body = data.split(b"\0", 1)
+		kind = entry["kind"]
+		oid = subprocess.check_output([
+			"git", "--git-dir", cache, "hash-object", "-w", "-t", kind, "--stdin"
+		], input=body).decode().strip()
+		expected = entry.get("git", {}).get("oid")
+		if expected and oid != expected:
+			raise SystemExit(f"Git oid mismatch for {tau_hash}: {oid} != {expected}")
+	for ref, tau_ref in manifest.get("refs", {}).items():
+		tau_hash = tau_ref.removeprefix("tau:")
+		oid = objects[tau_hash]["git"]["oid"]
+		subprocess.run(["git", "--git-dir", cache, "update-ref", ref, oid], check=True)
+PY
 }
 
 publish_manifest () {
@@ -116,10 +208,15 @@ publish_manifest () {
 		echo '  "objects": {'
 		sep=''
 		sort -u "$objects_tmp" |
-		while read tau_hash oid type size
+		while read tau_hash oid type size address
 		do
 			test -n "$tau_hash" || continue
-			printf '%s    "%s": {"kind": "%s", "payload_codec": "git-raw-v1", "size": %s, "git": {"hash_algorithm": "sha1", "oid": "%s"}}' "$sep" "$tau_hash" "$type" "$size" "$oid"
+			printf '%s    "%s": {"kind": "%s", "payload_codec": "git-raw-v1", "size": %s, "git": {"hash_algorithm": "sha1", "oid": "%s"}' "$sep" "$tau_hash" "$type" "$size" "$oid"
+			if test "$address" != -
+			then
+				printf ', "taustorage": {"address": "%s"}' "$(json_escape "$address")"
+			fi
+			printf '}'
 			sep=',
 '
 		done
@@ -128,7 +225,7 @@ publish_manifest () {
 		echo '  "git_to_tau": {'
 		sep=''
 		sort -u "$objects_tmp" |
-		while read tau_hash oid type size
+		while read tau_hash oid type size address
 		do
 			test -n "$tau_hash" || continue
 			printf '%s    "git:sha1:%s": "%s"' "$sep" "$oid" "$tau_hash"
@@ -141,6 +238,12 @@ publish_manifest () {
 		echo '}'
 	} >"$manifest_tmp" || return 1
 	mv "$manifest_tmp" "$latest" || return 1
+	if use_taustorage
+	then
+		addr=$(tau_upload "$latest") || return 1
+		test -n "$addr" || return 1
+		printf '%s\n' "$addr" >"$latest_addr"
+	fi
 	rm -f "$refs_tmp" "$objects_tmp"
 }
 
@@ -159,6 +262,7 @@ do
 		echo
 		;;
 	list)
+		materialize_cache_from_manifest || exit 1
 		test -n "$object_format" && echo ":object-format $(git --git-dir="$cache_git" rev-parse --show-object-format=storage)"
 		git --git-dir="$cache_git" for-each-ref --format='? %(refname)' refs/heads refs/tags
 		head=$(git --git-dir="$cache_git" symbolic-ref HEAD 2>/dev/null || true)
@@ -166,6 +270,7 @@ do
 		echo
 		;;
 	import*)
+		materialize_cache_from_manifest || exit 1
 		refs=
 		while true
 		do

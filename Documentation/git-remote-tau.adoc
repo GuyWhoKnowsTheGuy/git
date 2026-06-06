@@ -28,13 +28,16 @@ the normal serialized Git object byte stream:
 
 	<object-type> <size>\0<body>
 
-The Tau identity of that payload is the SHA-256 content address used by the
-prototype local Tau store.  A later implementation can replace this local store
-with the real TauStorage API without changing the user-facing `tau://` transport
-contract.
+The Tau identity of that payload is a content address.  In local-only mode the
+payload is stored under `GIT_TAU_STORE`.  When TauStorage client mode is enabled,
+the helper uploads/downloads payloads and manifests through the networked
+TauStorage/Autonomi-compatible client API.
 
-STORAGE
--------
+STORAGE MODES
+-------------
+
+Local prototype store
+~~~~~~~~~~~~~~~~~~~~~
 
 By default, the prototype store lives at:
 
@@ -56,6 +59,61 @@ The store contains:
 `repos/<name>/latest.json`::
 	The latest Tau-native manifest.  Refs in this manifest point to Tau object IDs,
 	not Git object IDs.
+
+TauStorage client API mode
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Set `GIT_TAU_DEVNET_MANIFEST` to enable networked TauStorage client mode.  The
+helper then calls an Autonomi-compatible client command for every object payload
+and manifest:
+
+[listing]
+----
+ant file upload <payload> \
+	--public \
+	--devnet-manifest <manifest> \
+	--allow-loopback \
+	--evm-network <network>
+
+ant file download <address> -o <output> \
+	--devnet-manifest <manifest> \
+	--allow-loopback \
+	--evm-network <network>
+----
+
+Environment variables:
+
+`GIT_TAU_CLIENT`::
+	Client executable. Defaults to `ant`.
+
+`GIT_TAU_DEVNET_MANIFEST`::
+	Path to the TauStorage/Autonomi devnet manifest. Setting this enables
+	TauStorage client API mode.
+
+`GIT_TAU_EVM_NETWORK`::
+	EVM network argument for the client. Defaults to `local`.
+
+`GIT_TAU_STORE`::
+	Local helper state, manifest pointer files, and bridge cache. Even in
+	TauStorage client mode this remains the local working cache, not the canonical
+	object store.
+
+In TauStorage client mode, each object entry records the returned network
+address:
+
+[listing]
+----
+"<tau-hash>": {
+  "kind": "blob",
+  "payload_codec": "git-raw-v1",
+  "git": { "hash_algorithm": "sha1", "oid": "<git-object-id>" },
+  "taustorage": { "address": "tau://..." }
+}
+----
+
+The latest manifest is also uploaded; its returned address is stored locally in:
+
+	$GIT_TAU_STORE/repos/<name>/latest.addr
 
 MANIFEST SHAPE
 --------------
@@ -79,6 +137,9 @@ A published manifest contains fields like:
       "git": {
         "hash_algorithm": "sha1",
         "oid": "<git-object-id>"
+      },
+      "taustorage": {
+        "address": "tau://<network-address>"
       }
     }
   },
@@ -91,10 +152,11 @@ A published manifest contains fields like:
 LIMITATIONS
 -----------
 
-This is the first fork-level Tau transport MVP.  It intentionally uses a local
-content-addressed store plus a bare Git cache.  The Tau-native manifest format,
-helper protocol plumbing, and `tau://` UX are in place; replacing the local store
-with real TauStorage network reads/writes is future work.
+This is an MVP transport for the forked Git client.  Tau-native manifests,
+network client upload/download plumbing, and `tau://` Git UX are in place.  The
+current payload codec still uses `git-raw-v1` and a local bare Git bridge cache;
+a future version can switch the payload codec to Tau-native commit/tree/blob
+objects.
 
 SEE ALSO
 --------
